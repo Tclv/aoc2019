@@ -1,19 +1,21 @@
 {-# LANGUAGE RecordWildCards #-}
 
+import           Control.Applicative
 import           Control.Exception
-import           Control.Monad      ((>=>))
+import           Control.Monad       ((<=<))
 import           Data.Char
-import           Data.IntMap.Strict (IntMap, (!))
-import qualified Data.IntMap.Strict as IntMap
+import           Data.IntMap.Strict  (IntMap, (!))
+import qualified Data.IntMap.Strict  as IntMap
 import           Data.List.Split
 import           Data.Maybe
 import           Debug.Trace
+import           Text.Read           (readMaybe)
 
 type Register = IntMap.IntMap Int
 
 type Address = Int
 
-type Op = Int -> Int -> Int
+type Operation = Int -> Int -> Int
 
 type Comp = Int -> Int -> Bool
 
@@ -28,7 +30,25 @@ data Program = Program
   , status   :: Status
   } deriving (Eq, Show)
 
-type Modes = [Int]
+
+data Mode = Immediate | Position
+  deriving (Eq, Show)
+
+
+instance Show Op where
+  show (Alu _ m1 m2)  = "Alu " ++ show m1 ++ " " ++ show m2
+  show (Jump _ m1 m2) = "Jump " ++ show m1 ++ " " ++ show m2
+  show Input          = "Input"
+  show (Output m1)    = "Output " ++ show m1
+  show Terminate      = "Terminate"
+
+data Op
+  = Alu Operation Mode Mode
+  | Jump Comp Mode Mode
+  | Input
+  | Output Mode
+  | Terminate
+
 
 (##) :: [a] -> Int -> Maybe a
 (x:_) ## 0  = Just x
@@ -36,90 +56,95 @@ type Modes = [Int]
 (x:xs) ## n = xs ## (n - 1)
 
 
-decode :: Int -> (Int, [Int])
-decode inst = (read opcode, reverse $ map digitToInt paramModes)
-  where
-    s = show inst
-    (paramModes, opcode) = splitAt (length s - 2) s
+toModes :: Int -> Maybe Mode
+toModes 0 = Just Position
+toModes 1 = Just Immediate
+toModes _ = Nothing
 
+prependZeros :: String -> String
+prependZeros xs
+  | length xs >= 5 = xs
+  | otherwise = prependZeros ('0' : xs)
 
--- Volgens mij moet deze nog gerefactored worden naar gewoon Maybe
-mode :: Int -> Modes -> Int
-mode idx modes =  fromMaybe 0 $ modes ## idx
+decode :: Int -> Maybe Op
+decode inst = do
+  let (op', modes') = splitAt 2 . reverse . prependZeros $ show inst
+  op <- readMaybe . reverse $ op'
+  modes <- traverse (toModes . digitToInt) modes'
+  let m1 = modes ## 0
+  let m2 = modes ## 1
+  let m3 = modes ## 2
+  case op of
+    1  -> liftA2 (Alu (+)) m1 m2
+    2  -> liftA2 (Alu (*)) m1 m2
+    3  -> Just Input
+    4  -> fmap Output m1
+    5  -> liftA2 (Jump (/=)) m1 m2
+    6  -> liftA2 (Jump (==)) m1 m2
+    7  -> liftA2 (Alu lt) m1 m2
+    8  -> liftA2 (Alu eq) m1 m2
+    99 -> Just Terminate
+    _  -> Nothing
 
-comp :: Comp -> Op
+comp :: Comp -> Operation
 comp op a b
   | a `op` b = 1
   | otherwise = 0
 
-lt :: Op
+lt :: Operation
 lt = comp (<)
 
-eq :: Op
+eq :: Operation
 eq = comp (==)
 
-
 getReg :: Program -> Address -> Maybe Int
-getReg Program{..} = flip IntMap.lookup register . (counter +)
+getReg Program{..} = flip IntMap.lookup register
 
-loadWord :: Program -> Modes -> Address -> Maybe Int
-loadWord p@Program {..} modes x = (getReg p >=> load (mode (x - 1) modes)) x
-  where
-    load :: Int -> Address -> Maybe Int
-    load mode val =
-      case mode of
-        0 -> IntMap.lookup val register
-        1 -> Just val
-        _ -> Nothing
+loadWord :: Program -> Mode -> Address -> Maybe Int
+loadWord p@Program {..} Position  = getReg p <=< getReg p . (counter +)
+loadWord p@Program {..} Immediate = getReg p . (counter +)
 
-alu :: Program -> Modes -> Op -> Maybe Program
-alu p@Program {..} modes op = do
-  a <- loadWord p modes 1
-  b <- loadWord p modes 2
-  addr <- getReg p 3
+alu :: Program -> Operation -> (Mode, Mode) -> Maybe Program
+alu p@Program {..} op (m1, m2) = do
+  a <- loadWord p m1 1
+  b <- loadWord p m2 2
+  addr <- loadWord p Immediate 3
   let reg' = IntMap.insert addr (a `op` b) register
   return p{register=reg', counter=counter + 4}
 
-jump :: Program -> Modes -> Comp -> Maybe Program
-jump p@Program {..} modes comp = do
-  val <- loadWord p modes 1
-  addr <- loadWord p modes 2
+jump :: Program -> Comp -> (Mode, Mode) -> Maybe Program
+jump p@Program {..} comp (m1, m2) = do
+  val <- loadWord p m1 1
+  addr <- loadWord p m2 2
   let counter' = if val `comp` 0 then addr else counter + 3
   return p{counter=counter'}
 
-store :: Program -> Modes -> Maybe Program
-store p@Program{..} modes = do
-  x <- loadWord p modes 1
+output :: Program -> Mode -> Maybe Program
+output p@Program{..} mode = do
+  x <- loadWord p mode 1
   return p{outputs=x : outputs, counter=counter + 2}
 
 safeHead :: [Int] -> Maybe (Int, [Int])
 safeHead (x:xs) = Just (x, xs)
 safeHead _      = Nothing
 
-load :: Program -> Maybe Program
-load p@Program{..} = do
+input :: Program -> Maybe Program
+input p@Program{..} = do
   (x, xs) <- safeHead inputs
-  dest <- getReg p 1
+  dest <- loadWord p Immediate 1
   let reg' = IntMap.insert dest x register
   return p{register=reg', inputs=xs, counter=counter + 2}
 
 step :: Program -> Maybe Program
 step p@Program{status=Stop} = Just p
 step p@Program{..} = do
-  (opcode, modes) <- decode <$> getReg p 0
-  let alu' = alu p modes
-      jump' = jump p modes
-  case opcode of
-    1  -> alu' (+)
-    2  -> alu' (*)
-    3  -> load p
-    4  -> store p modes
-    5  -> jump' (/=) -- jump-if-true
-    6  -> jump' (==) -- jump-if-false
-    7  -> alu' lt -- less than
-    8  -> alu' eq -- equals
-    99 -> Just p{status=Stop}
-    _  -> Nothing
+  op <- loadWord p Immediate 0 >>= decode
+  case op of
+    Alu op m1 m2    -> alu p op (m1, m2)
+    Input           -> input p
+    Jump comp m1 m2 -> jump p comp (m1, m2)
+    Output mode     -> output p mode
+    Terminate       -> Just p{status=Stop}
 
 initRegister :: [Int] -> Register
 initRegister = IntMap.fromList . zip [0 ..]
@@ -127,7 +152,7 @@ initRegister = IntMap.fromList . zip [0 ..]
 initProgram :: [Int] -> [Int] -> Program
 initProgram memory inputs = Program
   { register=initRegister memory
-  , inputs=reverse inputs
+  , inputs=inputs
   , outputs=[]
   , counter=0
   , status=Running
@@ -157,9 +182,8 @@ runDiagnostic = recurse []
                     in case x of
                          Just p  -> recurse (p:xs) p
                          Nothing -> xs
-
 main :: IO ()
 main = do
   day05 <- loadFile "day05.txt"
   let prog05 = initProgram day05 [5]
-  print $ run $ prog05
+  print $ outputs <$> run prog05
