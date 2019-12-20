@@ -2,14 +2,15 @@
 
 import           Control.Applicative
 import           Control.Exception
-import           Control.Monad       ((<=<))
+import           Control.Monad            ((<=<))
+import           Control.Monad.State.Lazy
 import           Data.Char
-import           Data.IntMap.Strict  (IntMap, (!))
-import qualified Data.IntMap.Strict  as IntMap
+import           Data.IntMap.Lazy         (IntMap, (!))
+import qualified Data.IntMap.Lazy         as IntMap
 import           Data.List.Split
 import           Data.Maybe
 import           Debug.Trace
-import           Text.Read           (readMaybe)
+import           Text.Read                (readMaybe)
 
 type Register = IntMap.IntMap Int
 
@@ -21,6 +22,8 @@ type Comp = Int -> Int -> Bool
 
 data Status = Running | Stop
   deriving (Eq, Show)
+
+type Execution a = StateT Program Maybe a
 
 data Program = Program
   { counter  :: Address
@@ -97,54 +100,74 @@ lt = comp (<)
 eq :: Operation
 eq = comp (==)
 
-getReg :: Program -> Address -> Maybe Int
-getReg Program{..} = flip IntMap.lookup register
+getReg :: Address -> Execution Int
+getReg addr = do
+  reg <- gets register
+  lift (IntMap.lookup addr reg)
 
-loadWord :: Program -> Mode -> Address -> Maybe Int
-loadWord p@Program {..} Position  = getReg p <=< getReg p . (counter +)
-loadWord p@Program {..} Immediate = getReg p . (counter +)
+load :: Mode -> Address -> Execution Int
+load Position addr  = load Immediate addr >>= getReg
+load Immediate addr = (+ addr) <$> gets counter >>= getReg
 
-alu :: Program -> Operation -> (Mode, Mode) -> Maybe Program
-alu p@Program {..} op (m1, m2) = do
-  a <- loadWord p m1 1
-  b <- loadWord p m2 2
-  addr <- loadWord p Immediate 3
-  let reg' = IntMap.insert addr (a `op` b) register
-  return p{register=reg', counter=counter + 4}
+store :: Address -> Int -> Execution ()
+store addr val = modify insertVal
+  where
+    insertVal :: Program -> Program
+    insertVal program = let r' = IntMap.insert addr val (register program)
+                         in program{register=r'}
 
-jump :: Program -> Comp -> (Mode, Mode) -> Maybe Program
-jump p@Program {..} comp (m1, m2) = do
-  val <- loadWord p m1 1
-  addr <- loadWord p m2 2
-  let counter' = if val `comp` 0 then addr else counter + 3
-  return p{counter=counter'}
+increaseCounter :: Int -> Execution ()
+increaseCounter i = modify (\p -> p{counter=counter p + i})
 
-output :: Program -> Mode -> Maybe Program
-output p@Program{..} mode = do
-  x <- loadWord p mode 1
-  return p{outputs=x : outputs, counter=counter + 2}
+setCounter :: Int -> Execution ()
+setCounter i = modify (\p -> p{counter=i})
+
+alu :: Operation -> (Mode, Mode) -> Execution ()
+alu op (m1, m2) = do
+  a <- load m1 1
+  b <- load m2 2
+  addr <- load Immediate 3
+  increaseCounter 4
+  store addr (a `op` b)
+
+jump :: Comp -> (Mode, Mode) -> Execution ()
+jump comp (m1, m2) = do
+  val <- load m1 1
+  addr <- load m2 2
+  if val `comp` 0 then setCounter addr else increaseCounter 3
+
+output :: Mode -> Execution ()
+output mode = do
+  x <- load mode 1
+  modify (\p -> p{outputs = x : outputs p})
+  increaseCounter 2
 
 safeHead :: [Int] -> Maybe (Int, [Int])
 safeHead (x:xs) = Just (x, xs)
 safeHead _      = Nothing
 
-input :: Program -> Maybe Program
-input p@Program{..} = do
-  (x, xs) <- safeHead inputs
-  dest <- loadWord p Immediate 1
-  let reg' = IntMap.insert dest x register
-  return p{register=reg', inputs=xs, counter=counter + 2}
+input :: Execution ()
+input = do
+  (x, xs) <- gets inputs >>= lift . safeHead
+  modify (\p -> p{inputs=xs})
+  dest <- load Immediate 1
+  store dest x
+  increaseCounter 2
 
-step :: Program -> Maybe Program
-step p@Program{status=Stop} = Just p
-step p@Program{..} = do
-  op <- loadWord p Immediate 0 >>= decode
-  case op of
-    Alu op m1 m2    -> alu p op (m1, m2)
-    Input           -> input p
-    Jump comp m1 m2 -> jump p comp (m1, m2)
-    Output mode     -> output p mode
-    Terminate       -> Just p{status=Stop}
+step :: Execution ()
+step = do
+  s <- gets status
+  case s of
+    Stop -> return ()
+    _ -> do
+      reg <- gets register
+      op <- load Immediate 0 >>= lift . decode
+      case op of
+        Alu op m1 m2    -> alu op (m1, m2)
+        Input           -> input
+        Jump comp m1 m2 -> jump comp (m1, m2)
+        Output mode     -> output mode
+        Terminate       -> modify (\p -> p{status=Stop})
 
 initRegister :: [Int] -> Register
 initRegister = IntMap.fromList . zip [0 ..]
@@ -160,7 +183,7 @@ initProgram memory inputs = Program
 
 run :: Program -> Maybe Program
 run p@Program {status=Stop, ..} = Just p
-run p                           = step p >>= run
+run p                           = execStateT step p >>= run
 
 verifyProg :: Monad m => Program -> [Int] -> m ()
 verifyProg prog expected =
@@ -178,12 +201,13 @@ runDiagnostic = recurse []
   where
     recurse :: [Program] -> Program -> [Program]
     recurse xs p@Program{status=Stop} = xs
-    recurse xs p = let x = step p
+    recurse xs p = let x = execStateT step p
                     in case x of
                          Just p  -> recurse (p:xs) p
                          Nothing -> xs
 main :: IO ()
 main = do
   day05 <- loadFile "day05.txt"
+  prog <- return [1,9,10,3,2,3,11,0,99,30,40,50]
   let prog05 = initProgram day05 [5]
-  print $ outputs <$> run prog05
+  print $ outputs <$> (run prog05)

@@ -20,3 +20,4 @@ executable day07
   build-depends:       base >= 4.7 && < 5
                      , split
                      , containers
+                     , mtl
